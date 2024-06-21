@@ -55,9 +55,7 @@ fn eng() -> Engine<UTConfig> {
 #[test]
 fn test_leader_append_membership_for_leader() -> anyhow::Result<()> {
     let mut eng = eng();
-    eng.state.server_state = ServerState::Leader;
     // Make it a real leader: voted for itself and vote is committed.
-    eng.state.vote = UTime::new(TokioInstant::now(), Vote::new_committed(2, 2));
     eng.vote_handler().become_leading();
 
     eng.replication_handler().append_membership(&log_id(3, 1, 4), &m34());
@@ -96,7 +94,7 @@ fn test_leader_append_membership_for_leader() -> anyhow::Result<()> {
 
 #[test]
 fn test_leader_append_membership_update_learner_process() -> anyhow::Result<()> {
-    // When updating membership, voter progreess should inherit from learner progress, and
+    // When updating membership, voter progress should inherit from learner progress, and
     // learner process should inherit from voter process. If voter changes to
     // learner or vice versa.
 
@@ -107,12 +105,11 @@ fn test_leader_append_membership_update_learner_process() -> anyhow::Result<()> 
         log_id(5, 1, 10),
     ]);
 
-    eng.state.server_state = ServerState::Leader;
-    // Make it a real leader: voted for itself and vote is committed.
-    eng.state.vote = UTime::new(TokioInstant::now(), Vote::new_committed(2, 2));
     eng.state
         .membership_state
         .set_effective(Arc::new(EffectiveMembership::new(Some(log_id(2, 1, 3)), m23_45())));
+
+    // Make it a real leader: voted for itself and vote is committed.
     eng.vote_handler().become_leading();
 
     if let Some(l) = &mut eng.internal_server_state.leading_mut() {

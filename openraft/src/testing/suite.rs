@@ -10,6 +10,7 @@ use maplit::btreeset;
 use crate::entry::RaftEntry;
 use crate::log_id::RaftLogId;
 use crate::membership::EffectiveMembership;
+use crate::raft_state::LogIOId;
 use crate::raft_state::LogStateReader;
 use crate::raft_state::RaftState;
 use crate::storage::LogFlushed;
@@ -99,6 +100,7 @@ where
         run_fut(run_test(builder, Self::get_initial_state_re_apply_committed))?;
         run_fut(run_test(builder, Self::save_vote))?;
         run_fut(run_test(builder, Self::get_log_entries))?;
+        run_fut(run_test(builder, Self::limited_get_log_entries))?;
         run_fut(run_test(builder, Self::try_get_log_entry))?;
         run_fut(run_test(builder, Self::initial_logs))?;
         run_fut(run_test(builder, Self::get_log_state))?;
@@ -116,8 +118,9 @@ where
         run_fut(run_test(builder, Self::apply_single))?;
         run_fut(run_test(builder, Self::apply_multiple))?;
 
-        // TODO(xp): test: finalized_snapshot, do_log_compaction, begin_receiving_snapshot,
-        // get_current_snapshot
+        run_fut(Self::transfer_snapshot(builder))?;
+
+        // TODO(xp): test: do_log_compaction
 
         Ok(())
     }
@@ -135,7 +138,7 @@ where
         {
             apply(&mut sm, [
                 blank_ent_0::<C>(1, 1),
-                membership_ent_0::<C>(1, 1, btreeset! {3,4,5}),
+                membership_ent_0::<C>(1, 2, btreeset! {3,4,5}),
             ])
             .await?;
 
@@ -718,6 +721,27 @@ where
         Ok(())
     }
 
+    pub async fn limited_get_log_entries(mut store: LS, mut sm: SM) -> Result<(), StorageError<C::NodeId>> {
+        Self::feed_10_logs_vote_self(&mut store).await?;
+
+        tracing::info!("--- get start == stop");
+        {
+            let logs = store.limited_get_log_entries(3, 3).await?;
+            assert_eq!(logs.len(), 0, "expected no logs to be returned");
+        }
+
+        tracing::info!("--- get start < stop");
+        {
+            let logs = store.limited_get_log_entries(5, 7).await?;
+
+            assert!(!logs.is_empty());
+            assert!(logs.len() <= 2);
+            assert_eq!(*logs[0].get_log_id(), log_id_0(1, 5));
+        }
+
+        Ok(())
+    }
+
     pub async fn try_get_log_entry(mut store: LS, mut sm: SM) -> Result<(), StorageError<C::NodeId>> {
         Self::feed_10_logs_vote_self(&mut store).await?;
 
@@ -1135,6 +1159,60 @@ where
         Ok(())
     }
 
+    /// Rudimentary test for snapshotting that builds a snapshot on one node and installs it on
+    /// another
+    pub async fn transfer_snapshot(builder: &B) -> Result<(), StorageError<C::NodeId>> {
+        // Create a snapshot on sm_l, and install it on sm_f
+        let (_g_l, _store_l, mut sm_l) = builder.build().await?;
+        let (_g_f, _store_f, mut sm_f) = builder.build().await?;
+
+        tracing::info!("--- make sure that initial snapshot is empty");
+        // Start with empty snapshot
+        assert!(sm_l.get_current_snapshot().await?.is_none(), "initialized snapshot");
+        assert!(sm_f.get_current_snapshot().await?.is_none(), "initialized snapshot");
+
+        // Add a few entries so we have state to snapshot
+        let snapshot_entries = vec![membership_ent_0::<C>(1, 2, btreeset! {1, 2, 3}), blank_ent_0::<C>(3, 3)];
+        sm_l.apply(snapshot_entries).await?;
+        let snapshot_last_log_id = Some(log_id_0(3, 3));
+        let snapshot_last_membership =
+            StoredMembership::new(Some(log_id_0(1, 2)), Membership::new(vec![btreeset![1, 2, 3]], None));
+        let snapshot_applied_state = (snapshot_last_log_id, snapshot_last_membership.clone());
+
+        tracing::info!("--- build and get snapshot on leader state machine");
+        let ss1 = sm_l.get_snapshot_builder().await.build_snapshot().await?;
+        assert_eq!(
+            ss1.meta.last_log_id, snapshot_last_log_id,
+            "built snapshot has wrong last log id"
+        );
+        assert_eq!(
+            ss1.meta.last_membership, snapshot_last_membership,
+            "built snapshot has wrong last membership"
+        );
+        let ss1_cur = sm_l.get_current_snapshot().await?.expect("uninitialized snapshot");
+        assert_eq!(
+            ss1_cur.meta, ss1.meta,
+            "current snapshot metadata not updated correctly on leader sm"
+        );
+
+        tracing::info!("--- install snapshot on follower state machine");
+        let mut ss2_box = sm_f.begin_receiving_snapshot().await?;
+        *ss2_box = *ss1_cur.snapshot;
+
+        sm_f.install_snapshot(&ss1_cur.meta, ss2_box).await?;
+
+        tracing::info!("--- check correctness of installed snapshot");
+        // ... by requesting whole snapshot
+        let ss2 = sm_f.get_current_snapshot().await?.expect("uninitialized snapshot");
+        assert_eq!(
+            ss2.meta, ss1.meta,
+            "snapshot metadata not updated correctly on follower sm"
+        );
+        // ... by checking smstore state
+        assert_eq!(sm_f.applied_state().await?, snapshot_applied_state);
+        Ok(())
+    }
+
     pub async fn feed_10_logs_vote_self(sto: &mut LS) -> Result<(), StorageError<C::NodeId>> {
         append(sto, [blank_ent_0::<C>(0, 0)]).await?;
 
@@ -1154,6 +1232,7 @@ where
     }
 }
 
+/// Create a log id with node id 0 for testing.
 fn log_id_0<NID>(term: u64, index: u64) -> LogId<NID>
 where NID: NodeId + From<u64> {
     LogId {
@@ -1221,14 +1300,14 @@ async fn append<C, LS, I>(store: &mut LS, entries: I) -> Result<(), StorageError
 where
     C: RaftTypeConfig,
     LS: RaftLogStorage<C>,
-    I: IntoIterator<Item = C::Entry>,
+    I: IntoIterator<Item = C::Entry> + OptionalSend,
+    I::IntoIter: OptionalSend,
 {
-    let entries = entries.into_iter().collect::<Vec<_>>();
-    let last_log_id = *entries.last().unwrap().get_log_id();
-
     let (tx, rx) = AsyncRuntimeOf::<C>::oneshot();
 
-    let cb = LogFlushed::new(Some(last_log_id), tx);
+    // Dummy log io id for blocking append
+    let log_io_id = LogIOId::<C::NodeId>::new(Vote::<C::NodeId>::default(), None);
+    let cb = LogFlushed::new(log_io_id, tx);
 
     store.append(entries, cb).await?;
     rx.await.unwrap().map_err(|e| StorageIOError::write_logs(AnyError::error(e)))?;

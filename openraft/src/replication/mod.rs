@@ -31,17 +31,15 @@ use crate::display_ext::DisplayOptionExt;
 use crate::error::HigherVote;
 use crate::error::PayloadTooLarge;
 use crate::error::RPCError;
-use crate::error::RaftError;
 use crate::error::ReplicationClosed;
 use crate::error::ReplicationError;
 use crate::error::Timeout;
 use crate::log_id::LogIdOptionExt;
 use crate::log_id_range::LogIdRange;
+use crate::network::v2::RaftNetworkV2;
 use crate::network::Backoff;
 use crate::network::RPCOption;
 use crate::network::RPCTypes;
-use crate::network::RaftNetwork;
-use crate::network::RaftNetworkFactory;
 use crate::raft::AppendEntriesRequest;
 use crate::raft::AppendEntriesResponse;
 use crate::replication::callbacks::SnapshotCallback;
@@ -58,6 +56,7 @@ use crate::AsyncRuntime;
 use crate::Instant;
 use crate::LogId;
 use crate::RaftLogId;
+use crate::RaftNetworkFactory;
 use crate::RaftTypeConfig;
 use crate::StorageError;
 use crate::StorageIOError;
@@ -393,21 +392,23 @@ where
                 let r = LogIdRange::new(rng.prev, rng.prev);
                 (vec![], r)
             } else {
-                let logs = self.log_reader.try_get_log_entries(start..end).await?;
-                debug_assert_eq!(
-                    logs.len(),
-                    (end - start) as usize,
-                    "expect logs {}..{} but got only {} entries, first: {}, last: {}",
+                // limited_get_log_entries will return logs smaller than the range [start, end).
+                let logs = self.log_reader.limited_get_log_entries(start, end).await?;
+
+                let first = *logs.first().map(|x| x.get_log_id()).unwrap();
+                let last = *logs.last().map(|x| x.get_log_id()).unwrap();
+
+                debug_assert!(
+                    !logs.is_empty() && logs.len() <= (end - start) as usize,
+                    "expect logs ⊆ [{}..{}) but got {} entries, first: {}, last: {}",
                     start,
                     end,
                     logs.len(),
-                    logs.first().map(|ent| ent.get_log_id()).display(),
-                    logs.last().map(|ent| ent.get_log_id()).display()
+                    first,
+                    last
                 );
 
-                let last_log_id = logs.last().map(|ent| *ent.get_log_id());
-
-                let r = LogIdRange::new(rng.prev, last_log_id);
+                let r = LogIdRange::new(rng.prev, Some(last));
                 (logs, r)
             }
         };
@@ -493,7 +494,7 @@ where
 
     /// Send the error result to RaftCore.
     /// RaftCore will then submit another replication command.
-    fn send_progress_error(&mut self, request_id: RequestId, err: RPCError<C, RaftError<C>>) {
+    fn send_progress_error(&mut self, request_id: RequestId, err: RPCError<C>) {
         let _ = self.tx_raft_core.send(Notify::Network {
             response: Response::Progress {
                 target: self.target,

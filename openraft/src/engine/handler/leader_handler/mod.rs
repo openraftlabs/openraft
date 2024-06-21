@@ -49,7 +49,9 @@ where C: RaftTypeConfig
             return;
         }
 
-        self.state.assign_log_ids(&mut entries);
+        // Engine::leader_handler() ensures it is a valid leader.
+        self.leader.assign_log_ids(&mut entries).unwrap();
+
         self.state.extend_log_ids_from_same_leader(&entries);
 
         let mut membership_entry = None;
@@ -63,7 +65,31 @@ where C: RaftTypeConfig
             }
         }
 
-        self.output.push_command(Command::AppendInputEntries { entries });
+        // TODO: In future implementations with asynchronous IO,
+        //       ensure logs are not written until the vote is committed
+        //       to maintain consistency.
+        //       ---
+        //       Currently, IO requests to `RaftLogStorage` are executed
+        //       within the `RaftCore` task. This means an `AppendLog` request
+        //       won't be submitted to `RaftLogStorage` until `save_vote()` completes,
+        //       which ensures consistency.
+        //       ---
+        //       However, when `RaftLogStorage` is moved to a separate task,
+        //       `RaftCore` will communicate with `RaftLogStorage` via a channel.
+        //       This change could result in `AppendLog` requests being submitted
+        //       before the previous `save_vote()` request is finished.
+        //       ---
+        //       This scenario creates a risk where a log entry becomes visible and
+        //       is replicated by `ReplicationCore` to other nodes before the vote
+        //       is flushed to disk. If the vote isn't flushed and the server restarts,
+        //       the vote could revert to a previous state. This could allow a new leader
+        //       to be elected with a smaller vote (term), breaking consistency.
+        self.output.push_command(Command::AppendInputEntries {
+            // A leader should always use the leader's vote.
+            // It is allowed to be different from local vote.
+            vote: self.leader.vote,
+            entries,
+        });
 
         let mut rh = self.replication_handler();
 

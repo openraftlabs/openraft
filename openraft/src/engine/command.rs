@@ -33,11 +33,21 @@ where C: RaftTypeConfig
     /// No longer a leader. Clean up leader's data.
     QuitLeader,
 
-    /// Append one entry.
-    AppendEntry { entry: C::Entry },
-
     /// Append a `range` of entries.
-    AppendInputEntries { entries: Vec<C::Entry> },
+    AppendInputEntries {
+        /// The vote of the leader that submits the entries to write.
+        ///
+        /// The leader could be a local leader that appends entries to the local log store,
+        /// or a remote leader that replicates entries to this follower.
+        ///
+        /// The leader id is used to generate a monotonic increasing IO id, such as: [`LogIOId`].
+        /// Where [`LogIOId`] is `(leader_id, log_id)`.
+        ///
+        /// [`LogIOId`]: crate::raft_state::io_state::log_io_id::LogIOId
+        vote: Vote<C::NodeId>,
+
+        entries: Vec<C::Entry>,
+    },
 
     /// Replicate the committed log id to other nodes
     ReplicateCommitted { committed: Option<LogId<C::NodeId>> },
@@ -121,8 +131,7 @@ where
         match (self, other) {
             (Command::BecomeLeader,                            Command::BecomeLeader)                                                          => true,
             (Command::QuitLeader,                              Command::QuitLeader)                                                            => true,
-            (Command::AppendEntry { entry },                   Command::AppendEntry { entry: b }, )                                            => entry == b,
-            (Command::AppendInputEntries { entries },          Command::AppendInputEntries { entries: b }, )                                   => entries == b,
+            (Command::AppendInputEntries { vote, entries },    Command::AppendInputEntries { vote: vb, entries: b }, )                         => vote == vb && entries == b,
             (Command::ReplicateCommitted { committed },        Command::ReplicateCommitted { committed: b }, )                                 => committed == b,
             (Command::Commit { seq, already_committed, upto, }, Command::Commit { seq: b_seq, already_committed: b_committed, upto: b_upto, }, ) => seq == b_seq && already_committed == b_committed && upto == b_upto,
             (Command::Replicate { target, req },               Command::Replicate { target: b_target, req: other_req, }, )                     => target == b_target && req == other_req,
@@ -150,7 +159,6 @@ where C: RaftTypeConfig
             Command::RebuildReplicationStreams { .. } => CommandKind::Main,
             Command::Respond { .. }                   => CommandKind::Main,
 
-            Command::AppendEntry { .. }               => CommandKind::Log,
             Command::AppendInputEntries { .. }        => CommandKind::Log,
             Command::SaveVote { .. }                  => CommandKind::Log,
             Command::PurgeLog { .. }                  => CommandKind::Log,
@@ -174,7 +182,6 @@ where C: RaftTypeConfig
         match self {
             Command::BecomeLeader                     => None,
             Command::QuitLeader                       => None,
-            Command::AppendEntry { .. }               => None,
             Command::AppendInputEntries { .. }        => None,
             Command::ReplicateCommitted { .. }        => None,
             // TODO: Apply also write `committed` to log-store, which should be run in CommandKind::Log
