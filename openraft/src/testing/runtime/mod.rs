@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Duration;
 
 use crate::async_runtime::Mpsc;
 use crate::async_runtime::MpscReceiver;
@@ -44,8 +45,13 @@ pub struct Suite<Rt: AsyncRuntime> {
 impl<Rt: AsyncRuntime> Suite<Rt> {
     pub async fn test_all() {
         Self::test_spawn_join_handle().await;
+        Self::test_thread_rng().await;
         Self::test_sleep().await;
         Self::test_instant().await;
+        Self::test_instant_arithmetic().await;
+        Self::test_instant_sub_instant().await;
+        Self::test_instant_saturating_duration_since().await;
+        Self::test_instant_ord().await;
         Self::test_sleep_until().await;
         Self::test_timeout().await;
         Self::test_timeout_at().await;
@@ -55,12 +61,15 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         Self::test_mpsc_weak_sender_wont_prevent_channel_close().await;
         Self::test_mpsc_weak_sender_upgrade().await;
         Self::test_mpsc_send().await;
+        Self::test_mpsc_send_to_closed_channel().await;
+        Self::test_mpsc_backpressure().await;
 
         Self::test_unbounded_mpsc_recv_empty().await;
         Self::test_unbounded_mpsc_recv_channel_closed().await;
         Self::test_unbounded_mpsc_weak_sender_wont_prevent_channel_close().await;
         Self::test_unbounded_mpsc_weak_sender_upgrade().await;
         Self::test_unbounded_mpsc_send().await;
+        Self::test_unbounded_mpsc_send_to_closed_channel().await;
 
         Self::test_watch_init_value().await;
         Self::test_watch_overwrite_init_value().await;
@@ -72,8 +81,11 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         Self::test_watch_changed_returns_immediately_when_unseen().await;
         Self::test_watch_multiple_borrow_then_changed().await;
         Self::test_watch_wait_loop_pattern().await;
+        Self::test_watch_multiple_receivers().await;
         Self::test_oneshot_drop_tx().await;
         Self::test_oneshot().await;
+        Self::test_oneshot_send_from_another_task().await;
+        Self::test_oneshot_send_to_dropped_rx().await;
         Self::test_mutex().await;
         Self::test_mutex_contention().await;
     }
@@ -86,9 +98,41 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         }
     }
 
+    /// Test `thread_rng()` returns a working random number generator.
+    pub async fn test_thread_rng() {
+        use rand::Rng;
+
+        let mut rng = Rt::thread_rng();
+
+        // Generate some random numbers to verify the RNG works
+        let r1: u32 = rng.random();
+        let r2: u32 = rng.random();
+        let r3: u32 = rng.random();
+
+        // While theoretically possible for all to be equal, it's astronomically unlikely
+        // This just verifies the RNG is functioning and producing values
+        let all_same = r1 == r2 && r2 == r3;
+        assert!(
+            !all_same || r1 != 0,
+            "RNG should produce varying values (got {}, {}, {})",
+            r1,
+            r2,
+            r3
+        );
+
+        // Test range generation
+        for _ in 0..100 {
+            let value: u32 = rng.random_range(0..100);
+            assert!(value < 100, "random_range should respect upper bound");
+        }
+
+        // Test bool generation works
+        let _: bool = rng.random();
+    }
+
     pub async fn test_sleep() {
         let start_time = std::time::Instant::now();
-        let dur_10ms = std::time::Duration::from_millis(10);
+        let dur_10ms = Duration::from_millis(10);
         Rt::sleep(dur_10ms).await;
         let elapsed = start_time.elapsed();
 
@@ -97,16 +141,102 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
 
     pub async fn test_instant() {
         let start_time = Rt::Instant::now();
-        let dur_10ms = std::time::Duration::from_millis(10);
+        let dur_10ms = Duration::from_millis(10);
         Rt::sleep(dur_10ms).await;
         let elapsed = start_time.elapsed();
 
         assert!(elapsed >= dur_10ms);
     }
 
+    /// Test `Instant + Duration` and `Instant - Duration` arithmetic.
+    pub async fn test_instant_arithmetic() {
+        let dur_100ms = Duration::from_millis(100);
+        let dur_50ms = Duration::from_millis(50);
+
+        let now = Rt::Instant::now();
+
+        // Test Add<Duration>
+        let later = now + dur_100ms;
+        assert!(later > now);
+
+        // Test Sub<Duration>
+        let earlier = later - dur_50ms;
+        assert!(earlier > now);
+        assert!(earlier < later);
+
+        // Test AddAssign<Duration>
+        let mut t = now;
+        t += dur_100ms;
+        assert_eq!(t, later);
+
+        // Test SubAssign<Duration>
+        let mut t2 = later;
+        t2 -= dur_50ms;
+        assert_eq!(t2, earlier);
+    }
+
+    /// Test `Instant - Instant` returns `Duration`.
+    pub async fn test_instant_sub_instant() {
+        let dur_50ms = Duration::from_millis(50);
+
+        let t1 = Rt::Instant::now();
+        Rt::sleep(dur_50ms).await;
+        let t2 = Rt::Instant::now();
+
+        // t2 - t1 should be approximately 50ms (at least 50ms)
+        let diff = t2 - t1;
+        assert!(diff >= dur_50ms);
+        // Should be less than 200ms (reasonable upper bound)
+        assert!(diff < Duration::from_millis(200));
+    }
+
+    /// Test `saturating_duration_since` returns zero when `self` is earlier.
+    pub async fn test_instant_saturating_duration_since() {
+        let dur_50ms = Duration::from_millis(50);
+
+        let t1 = Rt::Instant::now();
+        Rt::sleep(dur_50ms).await;
+        let t2 = Rt::Instant::now();
+
+        // t2.saturating_duration_since(t1) should be >= 50ms
+        let duration = t2.saturating_duration_since(t1);
+        assert!(duration >= dur_50ms);
+
+        // t1.saturating_duration_since(t2) should be zero (t1 is earlier)
+        let zero_duration = t1.saturating_duration_since(t2);
+        assert_eq!(zero_duration, Duration::from_secs(0));
+    }
+
+    /// Test `Instant` ordering: `Ord`, `PartialOrd`, `Eq`, `PartialEq`.
+    pub async fn test_instant_ord() {
+        let dur_10ms = Duration::from_millis(10);
+
+        let t1 = Rt::Instant::now();
+        Rt::sleep(dur_10ms).await;
+        let t2 = Rt::Instant::now();
+        let t1_copy = t1;
+
+        // PartialEq / Eq
+        assert_eq!(t1, t1_copy);
+        assert_ne!(t1, t2);
+
+        // PartialOrd
+        assert!(t1 < t2);
+        assert!(t2 > t1);
+        assert!(t1 <= t1_copy);
+        assert!(t1 >= t1_copy);
+        assert!(t1 <= t2);
+        assert!(t2 >= t1);
+
+        // Ord (via cmp)
+        assert_eq!(t1.cmp(&t1_copy), std::cmp::Ordering::Equal);
+        assert_eq!(t1.cmp(&t2), std::cmp::Ordering::Less);
+        assert_eq!(t2.cmp(&t1), std::cmp::Ordering::Greater);
+    }
+
     pub async fn test_sleep_until() {
         let start_time = Rt::Instant::now();
-        let dur_10ms = std::time::Duration::from_millis(10);
+        let dur_10ms = Duration::from_millis(10);
         let end_time = start_time + dur_10ms;
         Rt::sleep_until(end_time).await;
         let elapsed = start_time.elapsed();
@@ -117,12 +247,12 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         let ret_number = 1;
 
         // Won't time out
-        let dur_10ms = std::time::Duration::from_millis(10);
+        let dur_10ms = Duration::from_millis(10);
         let ret_value = Rt::timeout(dur_10ms, async move { ret_number }).await.unwrap();
         assert_eq!(ret_value, ret_number);
 
         // Will time out
-        let dur_1s = std::time::Duration::from_secs(1);
+        let dur_1s = Duration::from_secs(1);
         let timeout_result = Rt::timeout(dur_10ms, async {
             Rt::sleep(dur_1s).await;
             ret_number
@@ -135,13 +265,13 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         let ret_number = 1;
 
         // Won't time out
-        let dur_10ms = std::time::Duration::from_millis(10);
+        let dur_10ms = Duration::from_millis(10);
         let ddl = Rt::Instant::now() + dur_10ms;
         let ret_value = Rt::timeout_at(ddl, async move { ret_number }).await.unwrap();
         assert_eq!(ret_value, ret_number);
 
         // Will time out
-        let dur_1s = std::time::Duration::from_secs(1);
+        let dur_1s = Duration::from_secs(1);
         let ddl = Rt::Instant::now() + dur_10ms;
         let timeout_result = Rt::timeout_at(ddl, async {
             Rt::sleep(dur_1s).await;
@@ -222,6 +352,53 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         assert_eq!(recv_expected, recv);
     }
 
+    /// Test that `send()` returns `SendError` when receiver is dropped.
+    pub async fn test_mpsc_send_to_closed_channel() {
+        let (tx, rx) = Rt::Mpsc::channel::<i32>(5);
+        drop(rx);
+
+        let result = tx.send(42).await;
+        assert!(result.is_err());
+
+        // Verify the value is returned in the error
+        let err = result.unwrap_err();
+        assert_eq!(err.0, 42);
+    }
+
+    /// Test bounded channel backpressure: `send()` blocks when buffer is full.
+    pub async fn test_mpsc_backpressure() {
+        let buffer_size = 2;
+        let (tx, mut rx) = Rt::Mpsc::channel::<i32>(buffer_size);
+
+        // Fill the buffer
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+
+        // Next send should be pending (buffer is full)
+        let send_fut = tx.send(3);
+        let mut pinned_send_fut = pin!(send_fut);
+
+        // Verify send is blocked
+        assert!(
+            matches!(poll_in_place(pinned_send_fut.as_mut()), Poll::Pending),
+            "send() should be Pending when buffer is full"
+        );
+
+        // Receive one item to make room
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received, 1);
+
+        // Now the send should complete
+        assert!(
+            matches!(poll_in_place(pinned_send_fut.as_mut()), Poll::Ready(_)),
+            "send() should be Ready after space is available"
+        );
+
+        // Verify remaining items
+        assert_eq!(rx.recv().await.unwrap(), 2);
+        assert_eq!(rx.recv().await.unwrap(), 3);
+    }
+
     pub async fn test_unbounded_mpsc_recv_empty() {
         let (_tx, mut rx) = Rt::MpscUnbounded::channel::<()>();
         let recv_err = rx.try_recv().unwrap_err();
@@ -291,6 +468,19 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         recv.sort();
 
         assert_eq!(recv_expected, recv);
+    }
+
+    /// Test that unbounded `send()` returns `SendError` when receiver is dropped.
+    pub async fn test_unbounded_mpsc_send_to_closed_channel() {
+        let (tx, rx) = Rt::MpscUnbounded::channel::<i32>();
+        drop(rx);
+
+        let result = tx.send(42);
+        assert!(result.is_err());
+
+        // Verify the value is returned in the error
+        let err = result.unwrap_err();
+        assert_eq!(err.0, 42);
     }
 
     pub async fn test_watch_init_value() {
@@ -451,8 +641,8 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
     /// a subsequent call to `changed()` will properly wait for a new value instead of
     /// returning immediately (which would cause a hot loop / 100% CPU usage).
     pub async fn test_watch_changed_marks_as_seen() {
-        let dur_50ms = std::time::Duration::from_millis(50);
-        let dur_40ms = std::time::Duration::from_millis(40);
+        let dur_50ms = Duration::from_millis(50);
+        let dur_40ms = Duration::from_millis(40);
 
         let (tx, mut rx) = Rt::Watch::channel(0i32);
 
@@ -531,8 +721,8 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
     /// Since borrow_watched() uses borrow() which doesn't mark as seen,
     /// multiple calls shouldn't cause changed() to misbehave.
     pub async fn test_watch_multiple_borrow_then_changed() {
-        let dur_50ms = std::time::Duration::from_millis(50);
-        let dur_40ms = std::time::Duration::from_millis(40);
+        let dur_50ms = Duration::from_millis(50);
+        let dur_40ms = Duration::from_millis(40);
 
         let (tx, mut rx) = Rt::Watch::channel(0i32);
 
@@ -579,7 +769,7 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
     /// This simulates the pattern used in openraft's Wait::metrics() method,
     /// ensuring changed() properly waits between iterations.
     pub async fn test_watch_wait_loop_pattern() {
-        let dur_20ms = std::time::Duration::from_millis(20);
+        let dur_20ms = Duration::from_millis(20);
 
         let (tx, mut rx) = Rt::Watch::channel(0i32);
 
@@ -622,6 +812,52 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         drop(tx);
     }
 
+    /// Test `WatchReceiver::Clone` - multiple receivers can watch the same sender.
+    pub async fn test_watch_multiple_receivers() {
+        let (tx, rx1) = Rt::Watch::channel(0i32);
+        let rx2 = rx1.clone();
+        let rx3 = rx1.clone();
+
+        // All receivers should see the initial value
+        assert_eq!(*rx1.borrow_watched(), 0);
+        assert_eq!(*rx2.borrow_watched(), 0);
+        assert_eq!(*rx3.borrow_watched(), 0);
+
+        // Send a new value
+        tx.send(42).unwrap();
+
+        // All receivers should see the new value
+        assert_eq!(*rx1.borrow_watched(), 42);
+        assert_eq!(*rx2.borrow_watched(), 42);
+        assert_eq!(*rx3.borrow_watched(), 42);
+
+        // Test that each receiver can independently wait for changes
+        let (tx2, mut rx2_1) = Rt::Watch::channel(0i32);
+        let mut rx2_2 = rx2_1.clone();
+
+        // Spawn tasks that wait for changes on each receiver
+        let handle1 = Rt::spawn(async move {
+            rx2_1.changed().await.unwrap();
+            *rx2_1.borrow_watched()
+        });
+        let handle2 = Rt::spawn(async move {
+            rx2_2.changed().await.unwrap();
+            *rx2_2.borrow_watched()
+        });
+
+        // Give spawned tasks time to start waiting
+        Rt::sleep(Duration::from_millis(10)).await;
+
+        // Send a value - both receivers should wake up
+        tx2.send(100).unwrap();
+
+        let val1 = handle1.await.unwrap();
+        let val2 = handle2.await.unwrap();
+
+        assert_eq!(val1, 100);
+        assert_eq!(val2, 100);
+    }
+
     pub async fn test_oneshot_drop_tx() {
         let (tx, rx) = Rt::Oneshot::channel::<()>();
         drop(tx);
@@ -647,6 +883,19 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         let number_received = rx.await.unwrap();
 
         assert_eq!(number_to_send, number_received);
+    }
+
+    /// Test that oneshot `send()` returns `Err(T)` when receiver is dropped.
+    pub async fn test_oneshot_send_to_dropped_rx() {
+        let (tx, rx) = Rt::Oneshot::channel::<i32>();
+        drop(rx);
+
+        let result = tx.send(42);
+        assert!(result.is_err());
+
+        // Verify the value is returned in the error
+        let returned_value = result.unwrap_err();
+        assert_eq!(returned_value, 42);
     }
 
     pub async fn test_mutex_contention() {
@@ -704,12 +953,12 @@ fn poll_in_place<F: Future>(fut: Pin<&mut F>) -> Poll<F::Output> {
 
 /// Returns `true` if the future is ready when polled.
 fn is_ready<F: Future>(fut: F) -> bool {
-    let fut = fut;
     let pinned = pin!(fut);
     matches!(poll_in_place(pinned), Poll::Ready(_))
 }
 
 /// Returns `true` if the future is pending when polled.
 fn is_pending<F: Future>(fut: F) -> bool {
-    !is_ready(fut)
+    let pinned = pin!(fut);
+    matches!(poll_in_place(pinned), Poll::Pending)
 }
